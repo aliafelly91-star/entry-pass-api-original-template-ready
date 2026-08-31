@@ -12,6 +12,8 @@ import json
 import base64
 import urllib.request
 import urllib.error
+import time
+import uuid
 
 app = FastAPI(
     title="Entry Pass API",
@@ -32,6 +34,10 @@ TEMPLATE_PATH = BASE_DIR / "entry_pass_template.docx"
 HOTEL_TEMPLATE_PATH = BASE_DIR / "hotel_booking_template.docx"
 GEMMA_MODEL = "gemma-4-26b-a4b-it"
 GEMMA_API_KEY = os.getenv("GEMMA_API_KEY", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hifkuvyvhrxmcgkbvgqo.supabase.co").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+GEMMA_INPUT_COST_PER_MILLION = float(os.getenv("GEMMA_INPUT_COST_PER_MILLION", "0") or 0)
+GEMMA_OUTPUT_COST_PER_MILLION = float(os.getenv("GEMMA_OUTPUT_COST_PER_MILLION", "0") or 0)
 
 
 
@@ -215,6 +221,44 @@ def fill_hotel_booking(data: HotelBookingRequest):
     )
 
 
+def _log_ai_usage(*, provider: str, model: str, request_type: str = "passport_read",
+                  input_tokens: int = 0, output_tokens: int = 0, total_tokens: int = 0,
+                  estimated_cost_usd: float = 0.0, success: bool = True,
+                  error_code: str | None = None, latency_ms: int | None = None) -> None:
+    """Best-effort analytics logging. Never breaks the main passport request."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return
+    row = {
+        "request_id": str(uuid.uuid4()),
+        "provider": provider,
+        "model": model,
+        "request_type": request_type,
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "total_tokens": int(total_tokens or 0),
+        "estimated_cost_usd": float(estimated_cost_usd or 0),
+        "success": bool(success),
+        "error_code": error_code,
+        "latency_ms": int(latency_ms) if latency_ms is not None else None,
+    }
+    try:
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/ai_usage_logs",
+            data=json.dumps(row).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Prefer": "return=minimal",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as exc:
+        print(f"AI analytics log skipped: {exc}")
+
+
 GEMMA_PROMPT = r"""
 You are a passport data extraction engine. Analyze ONLY the passport identity page image.
 Return ONLY one valid JSON object, with no markdown and no explanation.
@@ -273,6 +317,7 @@ def _extract_json_object(text: str) -> dict:
 
 @app.post("/read-gemma")
 def read_gemma(data: GemmaReadRequest):
+    started_at = time.perf_counter()
     if not GEMMA_API_KEY:
         return {
             "ok": False,
@@ -332,12 +377,16 @@ def read_gemma(data: GemmaReadRequest):
             raw_response = response.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        _log_ai_usage(provider="gemma", model=GEMMA_MODEL, success=False, error_code=str(e.code), latency_ms=latency_ms)
         return {
             "ok": False,
             "error": f"Gemma HTTP {e.code}",
             "detail": detail[:1500],
         }
     except Exception as e:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        _log_ai_usage(provider="gemma", model=GEMMA_MODEL, success=False, error_code="connection_error", latency_ms=latency_ms)
         return {"ok": False, "error": f"Gemma connection error: {e}"}
 
     try:
@@ -354,14 +403,38 @@ def read_gemma(data: GemmaReadRequest):
         ).strip()
         result = _extract_json_object(text)
     except Exception as e:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        _log_ai_usage(provider="gemma", model=GEMMA_MODEL, success=False, error_code="parse_error", latency_ms=latency_ms)
         return {
             "ok": False,
             "error": f"Could not parse Gemma response: {e}",
             "raw": raw_response[:1500],
         }
 
+    usage = api_json.get("usageMetadata", {}) or {}
+    input_tokens = int(usage.get("promptTokenCount") or 0)
+    output_tokens = int(usage.get("candidatesTokenCount") or 0)
+    total_tokens = int(usage.get("totalTokenCount") or (input_tokens + output_tokens))
+    estimated_cost = (
+        (input_tokens / 1_000_000) * GEMMA_INPUT_COST_PER_MILLION
+        + (output_tokens / 1_000_000) * GEMMA_OUTPUT_COST_PER_MILLION
+    )
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    _log_ai_usage(
+        provider="gemma", model=GEMMA_MODEL, input_tokens=input_tokens,
+        output_tokens=output_tokens, total_tokens=total_tokens,
+        estimated_cost_usd=estimated_cost, success=True, latency_ms=latency_ms,
+    )
+
     return {
         "ok": True,
         "model": GEMMA_MODEL,
         "data": result,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": estimated_cost,
+            "latency_ms": latency_ms,
+        },
     }
