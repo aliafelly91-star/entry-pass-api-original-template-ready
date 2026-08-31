@@ -7,6 +7,11 @@ from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 import re
+import os
+import json
+import base64
+import urllib.request
+import urllib.error
 
 app = FastAPI(
     title="Entry Pass API",
@@ -25,6 +30,9 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "entry_pass_template.docx"
 HOTEL_TEMPLATE_PATH = BASE_DIR / "hotel_booking_template.docx"
+GEMMA_MODEL = "gemma-4-26b-a4b-it"
+GEMMA_API_KEY = os.getenv("GEMMA_API_KEY", "").strip()
+
 
 
 class EntryPassRequest(BaseModel):
@@ -46,6 +54,11 @@ class HotelBookingRequest(BaseModel):
     last_name: str = ""
     count: int = Field(ge=1, le=500)
     hotel: str = ""
+
+class GemmaReadRequest(BaseModel):
+    image_base64: str
+    mime_type: str = "image/jpeg"
+
 
 
 def _clean(value: str) -> str:
@@ -113,6 +126,8 @@ def health():
         "entry_template_exists": TEMPLATE_PATH.exists(),
         "hotel_template": HOTEL_TEMPLATE_PATH.name,
         "hotel_template_exists": HOTEL_TEMPLATE_PATH.exists(),
+        "gemma_model": GEMMA_MODEL,
+        "gemma_configured": bool(GEMMA_API_KEY),
     }
 
 
@@ -198,3 +213,155 @@ def fill_hotel_booking(data: HotelBookingRequest):
             "X-Hotel-Booking-Count": str(data.count),
         },
     )
+
+
+GEMMA_PROMPT = r"""
+You are a passport data extraction engine. Analyze ONLY the passport identity page image.
+Return ONLY one valid JSON object, with no markdown and no explanation.
+
+Required keys:
+{
+  "given_name_en": null,
+  "father_name_en": null,
+  "surname_en": null,
+  "passport_number": null,
+  "nationality": null,
+  "residence_country": null,
+  "birth_date": null,
+  "issue_date": null,
+  "expiry_date": null,
+  "sex": null,
+  "mrz_line1": null,
+  "mrz_line2": null,
+  "confidence": 0.0
+}
+
+Rules:
+- Never guess unreadable values; use null.
+- Dates must be YYYY-MM-DD.
+- nationality should be the 3-letter ICAO code when available, e.g. IRQ, PAK, IND.
+- sex must be M, F, or X when readable.
+- Copy MRZ lines exactly as visible, using < fillers.
+- Compare printed fields with MRZ before returning the result.
+- Prefer checksum-consistent MRZ for passport number, nationality, birth date, expiry date and sex.
+- For Pakistani passports, Father/Husband Name may be printed separately. Put that value in father_name_en.
+- Preserve the holder's printed English names; do not translate names here.
+- confidence must be a number from 0.0 to 1.0 reflecting overall readability and agreement.
+"""
+
+
+def _extract_json_object(text: str) -> dict:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        obj = json.loads(raw[start:end + 1])
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError("Gemma returned invalid JSON")
+
+
+@app.post("/read-gemma")
+def read_gemma(data: GemmaReadRequest):
+    if not GEMMA_API_KEY:
+        return {
+            "ok": False,
+            "error": "GEMMA_API_KEY is not configured on Render"
+        }
+
+    try:
+        image_bytes = base64.b64decode(data.image_base64, validate=True)
+    except Exception:
+        return {"ok": False, "error": "Invalid base64 image"}
+
+    if not image_bytes:
+        return {"ok": False, "error": "Empty image"}
+
+    if len(image_bytes) > 15 * 1024 * 1024:
+        return {"ok": False, "error": "Image is too large"}
+
+    mime_type = (data.mime_type or "image/jpeg").strip().lower()
+    if mime_type not in {"image/jpeg", "image/jpg", "image/png", "image/webp"}:
+        mime_type = "image/jpeg"
+
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": GEMMA_PROMPT},
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(image_bytes).decode("ascii")
+                    }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.0,
+            "thinkingConfig": {"thinkingLevel": "minimal"}
+        }
+    }
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMMA_MODEL}:generateContent"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMMA_API_KEY,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            raw_response = response.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        return {
+            "ok": False,
+            "error": f"Gemma HTTP {e.code}",
+            "detail": detail[:1500],
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"Gemma connection error: {e}"}
+
+    try:
+        api_json = json.loads(raw_response)
+        parts = (
+            api_json.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+        text = "\n".join(
+            str(part.get("text", ""))
+            for part in parts
+            if isinstance(part, dict) and part.get("text")
+        ).strip()
+        result = _extract_json_object(text)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"Could not parse Gemma response: {e}",
+            "raw": raw_response[:1500],
+        }
+
+    return {
+        "ok": True,
+        "model": GEMMA_MODEL,
+        "data": result,
+    }
