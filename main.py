@@ -133,7 +133,7 @@ def health():
         "hotel_template": HOTEL_TEMPLATE_PATH.name,
         "hotel_template_exists": HOTEL_TEMPLATE_PATH.exists(),
         "gemma_model": GEMMA_MODEL,
-        "gemma_configured": bool(GEMMA_API_KEY),
+        "gemma_configured": bool(GEMMA_API_KEY or SUPABASE_SERVICE_ROLE_KEY),
     }
 
 
@@ -224,7 +224,8 @@ def fill_hotel_booking(data: HotelBookingRequest):
 def _log_ai_usage(*, provider: str, model: str, request_type: str = "passport_read",
                   input_tokens: int = 0, output_tokens: int = 0, total_tokens: int = 0,
                   estimated_cost_usd: float = 0.0, success: bool = True,
-                  error_code: str | None = None, latency_ms: int | None = None) -> None:
+                  error_code: str | None = None, latency_ms: int | None = None,
+                  key_id: str | None = None) -> None:
     """Best-effort analytics logging. Never breaks the main passport request."""
     if not SUPABASE_SERVICE_ROLE_KEY:
         return
@@ -240,6 +241,7 @@ def _log_ai_usage(*, provider: str, model: str, request_type: str = "passport_re
         "success": bool(success),
         "error_code": error_code,
         "latency_ms": int(latency_ms) if latency_ms is not None else None,
+        "key_id": str(key_id) if key_id else None,
     }
     try:
         req = urllib.request.Request(
@@ -257,6 +259,84 @@ def _log_ai_usage(*, provider: str, model: str, request_type: str = "passport_re
             pass
     except Exception as exc:
         print(f"AI analytics log skipped: {exc}")
+
+
+_GEMMA_KEYS_CACHE: list[dict] = []
+_GEMMA_KEYS_CACHE_AT: float = 0.0
+_GEMMA_KEYS_CACHE_SECONDS = 30.0
+
+
+def _supabase_rest_request(path: str, *, method: str = "GET", body: dict | None = None,
+                           prefer: str | None = None) -> bytes:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not configured")
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+    payload = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        payload = json.dumps(body).encode("utf-8")
+    if prefer:
+        headers["Prefer"] = prefer
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        data=payload,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        return response.read()
+
+
+def _get_active_gemma_keys(force_refresh: bool = False) -> list[dict]:
+    """Return active Gemma keys from Supabase; Render env key remains fallback."""
+    global _GEMMA_KEYS_CACHE, _GEMMA_KEYS_CACHE_AT
+    now = time.monotonic()
+    if not force_refresh and _GEMMA_KEYS_CACHE and (now - _GEMMA_KEYS_CACHE_AT) < _GEMMA_KEYS_CACHE_SECONDS:
+        return list(_GEMMA_KEYS_CACHE)
+
+    keys: list[dict] = []
+    if SUPABASE_SERVICE_ROLE_KEY:
+        try:
+            raw = _supabase_rest_request(
+                "gemma_api_keys?select=id,api_key,label,is_active,created_at&is_active=eq.true&order=created_at.asc"
+            )
+            rows = json.loads(raw.decode("utf-8") or "[]")
+            if isinstance(rows, list):
+                for row in rows:
+                    api_key = str((row or {}).get("api_key") or "").strip()
+                    if api_key:
+                        keys.append({
+                            "id": str((row or {}).get("id") or ""),
+                            "api_key": api_key,
+                            "label": str((row or {}).get("label") or "Gemma Key"),
+                        })
+        except Exception as exc:
+            print(f"Gemma key pool unavailable; using Render fallback if present: {exc}")
+
+    # Keep the Render secret as a safe fallback without exposing it in the dashboard.
+    if not keys and GEMMA_API_KEY:
+        keys.append({"id": "render-env", "api_key": GEMMA_API_KEY, "label": "Render fallback"})
+
+    _GEMMA_KEYS_CACHE = list(keys)
+    _GEMMA_KEYS_CACHE_AT = now
+    return keys
+
+
+def _mark_gemma_key_used(key_id: str | None) -> None:
+    if not key_id or key_id == "render-env" or not SUPABASE_SERVICE_ROLE_KEY:
+        return
+    try:
+        _supabase_rest_request(
+            f"gemma_api_keys?id=eq.{key_id}",
+            method="PATCH",
+            body={"last_used_at": datetime.utcnow().isoformat() + "Z"},
+            prefer="return=minimal",
+        )
+    except Exception as exc:
+        print(f"Could not update Gemma last_used_at: {exc}")
 
 
 GEMMA_PROMPT = r"""
@@ -317,13 +397,6 @@ def _extract_json_object(text: str) -> dict:
 
 @app.post("/read-gemma")
 def read_gemma(data: GemmaReadRequest):
-    started_at = time.perf_counter()
-    if not GEMMA_API_KEY:
-        return {
-            "ok": False,
-            "error": "GEMMA_API_KEY is not configured on Render"
-        }
-
     try:
         image_bytes = base64.b64decode(data.image_base64, validate=True)
     except Exception:
@@ -331,7 +404,6 @@ def read_gemma(data: GemmaReadRequest):
 
     if not image_bytes:
         return {"ok": False, "error": "Empty image"}
-
     if len(image_bytes) > 15 * 1024 * 1024:
         return {"ok": False, "error": "Image is too large"}
 
@@ -358,83 +430,116 @@ def read_gemma(data: GemmaReadRequest):
         }
     }
 
+    keys = _get_active_gemma_keys()
+    if not keys:
+        return {
+            "ok": False,
+            "error": "No active Gemma key. Add one from the Admin Dashboard or configure GEMMA_API_KEY on Render."
+        }
+
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMMA_MODEL}:generateContent"
     )
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMMA_API_KEY,
-        },
-        method="POST",
-    )
+    errors: list[str] = []
 
-    try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            raw_response = response.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")
-        latency_ms = int((time.perf_counter() - started_at) * 1000)
-        _log_ai_usage(provider="gemma", model=GEMMA_MODEL, success=False, error_code=str(e.code), latency_ms=latency_ms)
-        return {
-            "ok": False,
-            "error": f"Gemma HTTP {e.code}",
-            "detail": detail[:1500],
-        }
-    except Exception as e:
-        latency_ms = int((time.perf_counter() - started_at) * 1000)
-        _log_ai_usage(provider="gemma", model=GEMMA_MODEL, success=False, error_code="connection_error", latency_ms=latency_ms)
-        return {"ok": False, "error": f"Gemma connection error: {e}"}
+    for key_ref in keys:
+        started_at = time.perf_counter()
+        key_id = str(key_ref.get("id") or "")
+        key_label = str(key_ref.get("label") or "Gemma Key")
+        api_key = str(key_ref.get("api_key") or "").strip()
+        if not api_key:
+            continue
 
-    try:
-        api_json = json.loads(raw_response)
-        parts = (
-            api_json.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [])
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
         )
-        text = "\n".join(
-            str(part.get("text", ""))
-            for part in parts
-            if isinstance(part, dict) and part.get("text")
-        ).strip()
-        result = _extract_json_object(text)
-    except Exception as e:
-        latency_ms = int((time.perf_counter() - started_at) * 1000)
-        _log_ai_usage(provider="gemma", model=GEMMA_MODEL, success=False, error_code="parse_error", latency_ms=latency_ms)
-        return {
-            "ok": False,
-            "error": f"Could not parse Gemma response: {e}",
-            "raw": raw_response[:1500],
-        }
 
-    usage = api_json.get("usageMetadata", {}) or {}
-    input_tokens = int(usage.get("promptTokenCount") or 0)
-    output_tokens = int(usage.get("candidatesTokenCount") or 0)
-    total_tokens = int(usage.get("totalTokenCount") or (input_tokens + output_tokens))
-    estimated_cost = (
-        (input_tokens / 1_000_000) * GEMMA_INPUT_COST_PER_MILLION
-        + (output_tokens / 1_000_000) * GEMMA_OUTPUT_COST_PER_MILLION
-    )
-    latency_ms = int((time.perf_counter() - started_at) * 1000)
-    _log_ai_usage(
-        provider="gemma", model=GEMMA_MODEL, input_tokens=input_tokens,
-        output_tokens=output_tokens, total_tokens=total_tokens,
-        estimated_cost_usd=estimated_cost, success=True, latency_ms=latency_ms,
-    )
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                raw_response = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _log_ai_usage(
+                provider="gemma", model=GEMMA_MODEL, success=False,
+                error_code=str(exc.code), latency_ms=latency_ms, key_id=key_id,
+            )
+            errors.append(f"{key_label}: HTTP {exc.code} - {detail[:250]}")
+            continue
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _log_ai_usage(
+                provider="gemma", model=GEMMA_MODEL, success=False,
+                error_code="connection_error", latency_ms=latency_ms, key_id=key_id,
+            )
+            errors.append(f"{key_label}: connection error - {exc}")
+            continue
+
+        try:
+            api_json = json.loads(raw_response)
+            parts = (
+                api_json.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [])
+            )
+            output_text = "\n".join(
+                str(part.get("text", ""))
+                for part in parts
+                if isinstance(part, dict) and part.get("text")
+            ).strip()
+            result = _extract_json_object(output_text)
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _log_ai_usage(
+                provider="gemma", model=GEMMA_MODEL, success=False,
+                error_code="parse_error", latency_ms=latency_ms, key_id=key_id,
+            )
+            errors.append(f"{key_label}: parse error - {exc}")
+            continue
+
+        usage = api_json.get("usageMetadata", {}) or {}
+        input_tokens = int(usage.get("promptTokenCount") or 0)
+        output_tokens = int(usage.get("candidatesTokenCount") or 0)
+        total_tokens = int(usage.get("totalTokenCount") or (input_tokens + output_tokens))
+        estimated_cost = (
+            (input_tokens / 1_000_000) * GEMMA_INPUT_COST_PER_MILLION
+            + (output_tokens / 1_000_000) * GEMMA_OUTPUT_COST_PER_MILLION
+        )
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+
+        _log_ai_usage(
+            provider="gemma", model=GEMMA_MODEL,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            total_tokens=total_tokens, estimated_cost_usd=estimated_cost,
+            success=True, latency_ms=latency_ms, key_id=key_id,
+        )
+        _mark_gemma_key_used(key_id)
+
+        return {
+            "ok": True,
+            "model": GEMMA_MODEL,
+            "data": result,
+            "usage": {
+                "key_id": key_id,
+                "key_label": key_label,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "estimated_cost_usd": estimated_cost,
+                "latency_ms": latency_ms,
+            },
+        }
 
     return {
-        "ok": True,
-        "model": GEMMA_MODEL,
-        "data": result,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-            "estimated_cost_usd": estimated_cost,
-            "latency_ms": latency_ms,
-        },
+        "ok": False,
+        "error": "All active Gemma keys failed",
+        "detail": "\n---\n".join(errors)[-5000:],
     }
+
