@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from docx import Document
 from io import BytesIO
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import os
 import json
@@ -52,6 +52,7 @@ class EntryPassRequest(BaseModel):
     marketing_company: str = ""
     telegram_destination: str = ""
     document_date: str = ""
+    document_number: int = Field(ge=1, le=999999999)
 
 
 class HotelBookingRequest(BaseModel):
@@ -60,6 +61,8 @@ class HotelBookingRequest(BaseModel):
     last_name: str = ""
     count: int = Field(ge=1, le=500)
     hotel: str = ""
+    document_date: str = ""
+    arrival_date: str = ""
 
 class GemmaReadRequest(BaseModel):
     image_base64: str
@@ -145,21 +148,39 @@ def fill_entry_pass(data: EntryPassRequest):
             "error": "قالب Word غير موجود على السيرفر"
         }
 
+    tomorrow = datetime.now() + timedelta(days=1)
+    arrival_default = tomorrow + timedelta(days=15)
+
     document_date = _clean(data.document_date)
     if not document_date:
-        document_date = datetime.now().strftime("%d / %m / %Y")
+        document_date = tomorrow.strftime("%d / %m / %Y")
+
+    arrival_date = _clean(data.arrival_date)
+    if not arrival_date:
+        arrival_date = arrival_default.strftime("%d / %m / %Y")
 
     replacements = {
+        "{{DOCUMENT_NUMBER}}": str(data.document_number),
+        "{{NUM}}": str(data.document_number),
         "{{NATIONALITY}}": _clean(data.nationality),
+        "{{NAT}}": _clean(data.nationality),
         "{{COUNT}}": str(data.count),
+        "{{CNT}}": str(data.count),
         "{{FIRST_NAME}}": _clean(data.first_name),
+        "{{FIRST}}": _clean(data.first_name),
         "{{LAST_NAME}}": _clean(data.last_name),
+        "{{LAST}}": _clean(data.last_name),
         "{{ENTRY_PORT}}": _clean(data.entry_port),
+        "{{PORT}}": _clean(data.entry_port),
         "{{HOTEL}}": _clean(data.hotel),
-        "{{ARRIVAL_DATE}}": _clean(data.arrival_date),
+        "{{ARRIVAL_DATE}}": arrival_date,
+        "{{ARR}}": arrival_date,
         "{{MARKETING_COMPANY}}": _clean(data.marketing_company),
+        "{{COMP}}": _clean(data.marketing_company),
         "{{TELEGRAM_DESTINATION}}": _clean(data.telegram_destination),
+        "{{TEL}}": _clean(data.telegram_destination),
         "{{DOCUMENT_DATE}}": document_date,
+        "{{DATE}}": document_date,
     }
 
     doc = Document(str(TEMPLATE_PATH))
@@ -180,6 +201,7 @@ def fill_entry_pass(data: EntryPassRequest):
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Entry-Pass-Count": str(data.count),
+            "X-Entry-Pass-Document-Number": str(data.document_number),
         },
     )
 
@@ -192,12 +214,19 @@ def fill_hotel_booking(data: HotelBookingRequest):
             "error": "قالب الحجز الفندقي غير موجود على السيرفر"
         }
 
+    tomorrow = datetime.now() + timedelta(days=1)
+    arrival_default = tomorrow + timedelta(days=15)
+    document_date = _clean(data.document_date) or tomorrow.strftime("%d / %m / %Y")
+    arrival_date = _clean(data.arrival_date) or arrival_default.strftime("%d / %m / %Y")
+
     replacements = {
         "{{COMPANY}}": _clean(data.company),
         "{{FIRST_NAME}}": _clean(data.first_name),
         "{{LAST_NAME}}": _clean(data.last_name),
         "{{COUNT}}": str(data.count),
         "{{HOTEL}}": _clean(data.hotel),
+        "{{DOCUMENT_DATE}}": document_date,
+        "{{ARRIVAL_DATE}}": arrival_date,
     }
 
     doc = Document(str(HOTEL_TEMPLATE_PATH))
